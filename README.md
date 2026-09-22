@@ -1,0 +1,1 @@
+Analysis associated with paper "Distinguishing a live-attenuated Salmonella Typhimurium vaccine strain from native Salmonella Typhimurium strains using whole-cell MALDI-TOF mass spectrometry". Raw spectra available from Ag Data Commons: https://doi.org/10.15482/USDA.ADC/32589033
