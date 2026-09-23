@@ -1,0 +1,1081 @@
+---
+title: "maldi_analysis_github"
+---
+
+```{r}
+library(cli)
+library(rlang)
+library(tidyverse)
+library(readxl)
+library(tidymodels)
+library(MALDIquant)
+library(MALDIquantForeign)
+library(MALDIrppa)
+library(mixOmics)
+library(ranger)
+library(vip)
+library(vegan)
+library(themis) 
+library(ggokabeito)
+library(patchwork)
+library(fuzzyjoin)
+
+```
+
+
+```{r, engine="bash"}
+# raw data available from Ag Data Commons: https://doi.org/10.15482/USDA.ADC/32589033
+
+unzip salmonella_typhimurium_spectra.zip
+# files uncompressed in native_salmonella_typhimurium_spectra directory
+
+```
+
+
+```{r}
+raw_spectra <- importBrukerFlex("native_salmonella_typhimurium_spectra/", removeEmptySpectra = T, verbose = F)
+length(raw_spectra) # 446
+
+# some spectra are "empty" due to poor sample acquisition
+
+```
+
+
+
+```{r}
+# trim spectra
+spectra <- trim(raw_spectra, range=c(2000,20000))
+
+# Transform intensities / variance stabilizing
+spectra <- transformIntensity(spectra, method="sqrt")
+
+# Smooth spectra
+spectra <- smoothIntensity(spectra, method="SavitzkyGolay", halfWindowSize=10)
+
+# Remove baseline
+spectra <- removeBaseline(spectra, method="SNIP", iterations=100)
+
+# Intensity calibration (y axis normalization)
+spectra <- calibrateIntensity(spectra, method="TIC")
+
+peaks <- detectPeaks(spectra, method="MAD", halfWindowSize=20, SNR=4)
+ref <- referencePeaks(peaks)
+warping_functions <- determineWarpingFunctions(peaks, reference = ref, tolerance = 0.002)
+peaks <- warpMassPeaks(peaks, warping_functions)
+peaks_bin <- binPeaks(peaks)
+peaks_bin <- filterPeaks(peaks_bin, minFrequency=0.1)
+
+sample_names <- sapply(peaks_bin, function(x)metaData(x)$sampleName)
+feature_matrix <- intensityMatrix(peaks_bin, spectra = spectra)
+rownames(feature_matrix) <- sample_names
+df_fm <- as.data.frame(feature_matrix)
+
+df_dates <- read_tsv("spectra_dates.tsv", col_names = c("date", "sample_names"))
+
+df_nvsl <- read_excel("metadata.xlsx") %>% 
+  dplyr::select(collection_id, source_species) %>% 
+  mutate(collection_id = sprintf("%03d", collection_id)) %>% 
+  mutate(collection_id = as.character(collection_id))
+
+df_pca <- df_fm %>% 
+  as_tibble(rownames = "sample_names") %>% 
+  mutate(sample_type = str_starts(sample_names, "mv"))  %>% 
+  mutate(sample_type = str_replace(sample_type, "FALSE", "Native")) %>% 
+  mutate(sample_type = str_replace(sample_type, "TRUE", "Vaccine")) %>% 
+  separate(col = sample_names, sep = "_", into = c("collection_id", "sample_prep"), remove = F) %>% 
+  mutate(sample_prep = replace_na(sample_prep, "hcca")) %>% 
+  mutate(sample_prep = str_replace(sample_prep, "hcca", "Direct")) %>% 
+  mutate(sample_prep = str_replace(sample_prep, "fa", "Extended Direct")) %>% 
+  relocate(sample_type, .after = sample_prep) %>% 
+  left_join(df_dates, by = "sample_names") %>% 
+  relocate(date, .after = sample_type) %>% 
+  left_join(df_nvsl, by = "collection_id") %>% 
+  relocate(source_species, .after = sample_type)
+
+df_pca
+
+```
+
+```{r}
+# distribution of source animals for the native strains
+
+df_pca %>% 
+  dplyr::filter(sample_type == "Native") %>% 
+  dplyr::select(collection_id, sample_type, source_species) %>% 
+  count(source_species) %>% 
+  ggplot(aes(x = reorder(source_species, -n), y = n)) +
+  geom_bar(stat = "identity") +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(0, 100)) +
+  scale_x_discrete(expand = expansion(add = 0.5)) +
+  coord_cartesian(clip = "off") +
+  labs(x = "\nSource Species", y = "Count") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+  )  
+
+# ggsave("Figure_S1.tiff", h = 3, w = 5.5, dpi = 150)
+
+```
+
+```{r}
+# Prior to evaluating discrimination between vaccine and native strains, we assessed the potential impact of operational factors - preparation method and spectral collection date - on spectra from the clonal vaccine strain
+
+set.seed(1987)
+
+df_pca_vaccine <- df_pca %>% 
+  dplyr::filter(sample_type == "Vaccine")
+
+df_pca_vaccine %>% 
+  count(sample_prep, date)
+
+df_vegan_vaccine <- df_pca_vaccine %>% 
+  dplyr::select(-sample_type, -sample_names, -sample_prep, -date, -source_species, -collection_id)
+
+vegan_vaccine_sample_prep <- df_pca_vaccine$sample_prep
+vegan_vaccine_date <- df_pca_vaccine$date
+
+adonis2(df_vegan_vaccine ~ vegan_vaccine_sample_prep + vegan_vaccine_date, method = "euclidean", permutations = 999, by = "term")
+
+# test for assumption of equal dispersion
+mat_vegan <- df_pca_vaccine %>% 
+  dplyr::select(-sample_type, -sample_names, -sample_prep, -date, -source_species, -collection_id) %>% 
+  as.matrix()
+
+vegan_dist <- vegdist(mat_vegan, method = "euclidean")
+
+betadisper_test <- betadisper(vegan_dist, vegan_vaccine_date)
+permutest(betadisper_test, permutations = 999)
+
+betadisper_test <- betadisper(vegan_dist, vegan_vaccine_sample_prep)
+permutest(betadisper_test, permutations = 999)
+
+```
+
+```{r}
+# Figure 1
+
+pca_rec <- recipe(~., data = df_pca_vaccine) %>%
+  update_role(sample_type, new_role = "id") %>%
+  update_role(sample_names, new_role = "id") %>%
+  update_role(sample_prep, new_role = "id") %>%
+  update_role(date, new_role = "id") %>%
+  update_role(source_species, new_role = "id") %>%
+  update_role(collection_id, new_role = "id") %>%
+  step_zv(all_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_corr(all_predictors(), threshold = 0.95) %>% 
+  step_normalize(all_predictors()) %>% 
+  step_pca(all_predictors(), num_comp = 2, id = "pca")
+
+pca_prep <- prep(pca_rec)
+
+var_exp <- pca_prep %>% 
+  tidy(id = "pca", type = "variance") %>% 
+  dplyr::filter(terms == "percent variance", component == 1 | component == 2 )
+
+p1 <- juice(pca_prep) %>%
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color = sample_prep), size = 1.2) +
+  scale_color_okabe_ito(order = c(3,6)) +
+  labs(x = "PC1 (26.3%)", y = "PC2 (20.0%)") +
+  scale_x_continuous(expand = expansion(mult = 0), limits = c(-10, 25)) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(-20, 20)) +
+  coord_cartesian(clip = "off") +
+  labs(color = "Sample\nPreparation") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    legend.position = "bottom",
+    legend.margin = margin(0, 0, 0, 0),
+    legend.title = element_text(hjust = 0.5),
+    legend.text = element_text(margin = margin(l = -3, unit = "pt"))
+  )  
+
+p2 <- juice(pca_prep, ) %>%
+  mutate(date = str_replace(date, "nov_20_2025", "Date 1")) %>% 
+  mutate(date = str_replace(date, "feb_10_2026", "Date 2 (+73 Days)")) %>% 
+  mutate(date = fct_relevel(date, "Date 1", "Date 2 (+73 Days)")) %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color = date), size = 1.2) +
+  scale_color_okabe_ito(order = c(1,2)) +
+  labs(x = "PC1 (26.3%)", y = "PC2 (20.0%)") +
+  scale_x_continuous(expand = expansion(mult = 0), limits = c(-10, 25)) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(-20, 20)) +
+  coord_cartesian(clip = "off") +
+  facet_wrap(~sample_prep) +
+  labs(color = "Spectra\nCollection Date") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black", face = "bold"),
+    legend.title = element_text(hjust = 0.5),
+    legend.position = "bottom",
+    legend.margin = margin(0, 0, 0, 0),
+    legend.text = element_text(margin = margin(l = -3, unit = "pt"))
+  )  
+
+p1 + p2 + 
+  plot_annotation(tag_levels = 'A') +
+  plot_layout(widths = c(1, 1.75)) &
+  theme(plot.margin = margin(-5,4,0.5,4),
+        plot.tag = element_text(vjust = -5))
+
+# ggsave("Figure_1.tiff", h = 3, w = 8, dpi = 150) 
+
+```
+
+```{r}
+# Figure 2
+
+peak_stability <- df_pca_vaccine %>% 
+  pivot_longer(cols = where(is.numeric), names_to = "peak", values_to = "intensity") %>% 
+  group_by(peak) %>% 
+  summarize(
+    eta_sq = {
+      fit <- aov(intensity ~ date + sample_prep, data = cur_data())
+      ss <- summary(fit)[[1]]
+      ss["date", "Sum Sq"] / sum(ss[["Sum Sq"]])
+    },
+    .groups = "drop"
+  ) %>% 
+  mutate(peak_bin = round(as.numeric(peak), 0))
+
+peak_stability_top <- peak_stability %>% 
+  arrange(eta_sq) %>% 
+  slice_max(eta_sq, n = 3)
+
+peak_stability_low <- peak_stability %>% 
+  arrange(eta_sq) %>% 
+  slice_min(eta_sq, n = 3)
+
+p1 <- df_pca_vaccine %>% 
+  pivot_longer(cols = where(is.numeric), names_to = "peak", values_to = "intensity") %>% 
+  mutate(peak_bin = round(as.numeric(peak), 0)) %>% 
+  dplyr::filter(peak %in% peak_stability_low$peak) %>% 
+  left_join(peak_stability, by = "peak_bin") %>%  
+  mutate(peak_bin = fct_reorder(as.factor(peak_bin), desc(eta_sq))) %>% 
+  mutate(peak_bin = str_replace(peak_bin, "$", " m/z")) %>% 
+  mutate(date = str_replace(date, "nov_20_2025", "Date 1")) %>% 
+  mutate(date = str_replace(date, "feb_10_2026", "Date 2\n(+73 Days)")) %>% 
+  mutate(date = fct_relevel(date, "Date 1", "Date 2\n(+73 Days)")) %>% 
+  ggplot(aes(x = date, y = intensity)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~peak_bin) +  
+  scale_y_continuous(expand = expansion(mult = 0), labels = scales::scientific, breaks = c(0, 2e-4, 4e-4, 6e-4, 8e-4)) +
+  scale_x_discrete(expand = expansion(add = 0.5)) +
+  coord_cartesian(ylim = c(0, 8e-4), clip = "off") +
+  labs(x = "Spectra Collection Date", y = "Peak Intensity") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = 0.5),
+    axis.text = element_text(color = "black"),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black", face = "bold"),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 5)
+  )  
+
+p2 <- df_pca_vaccine %>% 
+  pivot_longer(cols = where(is.numeric), names_to = "peak", values_to = "intensity") %>% 
+  mutate(peak_bin = round(as.numeric(peak), 0)) %>% 
+  dplyr::filter(peak %in% peak_stability_top$peak) %>% 
+  left_join(peak_stability, by = "peak_bin") %>%  
+  mutate(peak_bin = fct_reorder(as.factor(peak_bin), desc(eta_sq))) %>% 
+  mutate(peak_bin = str_replace(peak_bin, "$", " m/z")) %>% 
+  mutate(date = str_replace(date, "nov_20_2025", "Date 1")) %>% 
+  mutate(date = str_replace(date, "feb_10_2026", "Date 2\n(+73 Days)")) %>% 
+  mutate(date = fct_relevel(date, "Date 1", "Date 2\n(+73 Days)")) %>% 
+  ggplot(aes(x = date, y = intensity)) +
+  geom_boxplot(outlier.shape = NA) +
+  facet_wrap(~peak_bin) + 
+  scale_y_continuous(expand = expansion(mult = 0), labels = scales::scientific, breaks = c(0, 2e-4, 4e-4, 6e-4, 8e-4)) +
+  scale_x_discrete(expand = expansion(add = 0.5)) +
+  coord_cartesian(ylim = c(0, 8e-4), clip = "off") +
+  labs(x = "", y = "Peak Intensity") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.ticks = element_line(linewidth = 0.5),
+    axis.text = element_text(color = "black"),
+    axis.title.x = element_blank(),
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black", face = "bold"),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 5)
+  )  
+
+peak_stability_plot <- peak_stability %>% 
+  arrange(eta_sq) %>% 
+  mutate(
+    rank = row_number()
+  ) 
+
+p3 <- ggplot(peak_stability_plot, aes(x = rank, y = eta_sq)) +
+  geom_point(color = "black") + 
+  labs(x = "Peak Rank",
+       y = expression(eta^2 ~ "(Temporal Effect)"),
+      ) +
+  scale_x_continuous(expand = expansion(mult = 0), limits = c(1, 150), breaks = c(1, 25, 50, 75, 100, 125, 150)) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(0, 0.8)) +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    #panel.grid.major.x = element_blank(),
+    #panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    plot.margin = margin(t = 0, r = 7.5, b = 0, l = 0)
+  ) 
+
+p3 + (p2 / p1) + 
+  #plot_layout(axes = 'collect') +
+  plot_annotation(tag_levels = 'A') &
+  theme(plot.tag = element_text(vjust = -1))
+
+# ggsave("Figure_2.tiff", h = 4, w = 8, dpi = 150)
+
+```
+
+
+```{r}
+# PERMANOVA was performed using marginal sums of squares to assess the independent contribution of vaccine strain status and sample preparation method
+
+df_vegan <- df_pca %>% 
+  dplyr::select(-sample_type, -sample_names, -sample_prep, -date, -collection_id, -source_species)
+
+vegan_sample_type <- df_pca$sample_type
+vegan_sample_prep <- df_pca$sample_prep
+
+adonis2(df_vegan ~ vegan_sample_type + vegan_sample_prep, method = "euclidean", permutations = 999, by = "margin")
+
+# test for assumption of equal dispersion
+
+mat_vegan <- df_pca %>% 
+  dplyr::select(-sample_type, -sample_names, -sample_prep, -date, -collection_id, -source_species) %>% 
+  as.matrix()
+
+vegan_dist <- vegdist(mat_vegan, method = "euclidean")
+
+# some portion of the PERMANOVA signal may be driven by unequal dispersion, not just shifted centroids
+
+betadisper_test <- betadisper(vegan_dist, vegan_sample_type)
+permutest(betadisper_test, permutations = 999)
+
+betadisper_test <- betadisper(vegan_dist, vegan_sample_prep)
+permutest(betadisper_test, permutations = 999)
+
+# PERMANOVA identified vaccine strain status as the primary source of spectral variation. However, dispersion differed significantly between vaccine and native strains, with native strains exhibiting greater heterogeneity. Despite this, consistent separation by vaccine status was observed across ordination and machine learning analyses, supporting robust discrimination between native and vacine strains
+
+```
+
+```{r}
+# Figure 3
+
+pca_rec <- recipe(~., data = df_pca) %>%
+  update_role(sample_type, new_role = "id") %>%
+  update_role(sample_names, new_role = "id") %>%
+  update_role(sample_prep, new_role = "id") %>%
+  update_role(date, new_role = "id") %>%
+  update_role(collection_id, new_role = "id") %>%
+  update_role(source_species, new_role = "id") %>%
+  step_zv(all_predictors()) %>% 
+  step_nzv(all_predictors()) %>% 
+  step_corr(all_predictors(), threshold = 0.95) %>% 
+  step_normalize(all_predictors()) %>% 
+  step_pca(all_predictors(), num_comp = 2, id = "pca")
+
+pca_prep <- prep(pca_rec)
+
+var_exp <- pca_prep %>% 
+  tidy(id = "pca", type = "variance") %>% 
+  dplyr::filter(terms == "percent variance", component == 1 | component == 2 )
+
+juice(pca_prep, ) %>%
+  mutate(sample_type = str_replace(sample_type, "Vaccine", "Megan Vac 1")) %>% 
+  mutate(sample_type = fct_relevel(sample_type, "Native", "Megan Vac 1")) %>% 
+  ggplot(aes(PC1, PC2)) +
+  geom_point(aes(color = sample_type), size = 1.2) +
+  scale_color_okabe_ito(order = c(5,8)) +
+  facet_wrap(~sample_prep) +
+  scale_x_continuous(expand = expansion(mult = 0), limits = c(-15, 20)) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(-10, 15)) +
+  coord_cartesian(clip = "off") +
+  labs(x = "PC1 (35.7%)", y = "PC2 (13.4%)", color = "Isolate Source") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black", face = "bold"),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 2),
+    legend.text = element_text(margin = margin(l = -2.5, unit = "pt")),
+  )  
+  
+# ggsave("Figure_3.tiff", h = 2.5, w = 6, dpi = 150)
+
+```
+
+```{r}
+# functions to handle peak identification in training and test sets
+
+fit_maldi <- function(
+    spectra,
+    reference_peaks = NULL,
+    snr = 4,
+    baseline_iter = 100,
+    tolerance = 0.01,
+    tolerance_ppm = 500,
+    min_frequency = 0.1
+) {
+  spectra = trim(spectra, range=c(2000,20000))
+  spectra = transformIntensity(spectra, method = "sqrt")
+  spectra = smoothIntensity(spectra, method = "SavitzkyGolay", halfWindowSize = 10)
+  spectra = removeBaseline(spectra, method = "SNIP", iterations = baseline_iter)
+  spectra = calibrateIntensity(spectra, method="TIC")
+  peaks <- detectPeaks(spectra, method = "MAD", halfWindowSize = 20, SNR = snr)
+  if (is.null(reference_peaks)) {
+    reference_peaks <- referencePeaks(peaks)
+  }
+  warping_functions <- determineWarpingFunctions(peaks, reference = reference_peaks, tolerance = tolerance)
+  peaks <- warpMassPeaks(peaks, warping_functions)
+  peaks_bin <- binPeaks(peaks, method = "relaxed")
+  peaks_bin <- filterPeaks(peaks_bin, minFrequency = min_frequency) # labels, # mergeWhitelists
+
+  sample_names <- sapply(peaks_bin, function(x)metaData(x)$sampleName)
+  feature_matrix <- intensityMatrix(peaks_bin, spectra = spectra)
+  rownames(feature_matrix) <- sample_names
+  df_fm <- as.data.frame(feature_matrix)
+  
+  colnames(df_fm) <- as.character(round(as.numeric(colnames(df_fm)), 0))
+  train_bins <- as.numeric(colnames(df_fm))
+    
+  list(
+    X = df_fm,
+    reference_peaks = reference_peaks,
+    train_bins = train_bins,
+    warping_functions = warping_functions,
+    params = list(
+      snr = snr,
+      baseline_iter = baseline_iter,
+      tolerance = tolerance,
+      tolerance_ppm = tolerance_ppm,
+      min_frequency = min_frequency
+    )
+  )
+  
+}
+
+apply_maldi <- function(
+    spectra,
+    fit
+) {
+  spectra = trim(spectra, range=c(2000,20000))
+  spectra = transformIntensity(spectra, method = "sqrt")
+  spectra = smoothIntensity(spectra, method = "SavitzkyGolay", halfWindowSize = 10)
+  spectra = removeBaseline(spectra, method = "SNIP", iterations = fit$params$baseline_iter)
+  spectra = calibrateIntensity(spectra, method="TIC")
+  peaks <- detectPeaks(spectra, method = "MAD", halfWindowSize = 20, SNR = fit$params$snr)
+  warping_functions <- determineWarpingFunctions(
+    peaks, 
+    reference = fit$reference_peaks, 
+    tolerance = fit$params$tolerance
+  )
+  peaks <- warpMassPeaks(peaks, warping_functions)
+  peaks_mapped <- lapply(peaks, function(p) {
+    if (length(p) == 0) return(p)
+    
+    mz <- mass(p)
+    idx <- sapply(mz, function(x) which.min(abs(fit$train_bins - x)))
+    tolerance_da <- fit$train_bins[idx] * (fit$params$tolerance_ppm / 1000000)
+    keep <- abs(fit$train_bins[idx] - mz) <= tolerance_da
+    #keep <- abs(fit$train_bins[idx] - mz) <= 0.5
+    
+    if (!any(keep)) {
+      return(createMassPeaks(numeric(0), numeric(0)))
+    }
+    
+    createMassPeaks(
+      mass = fit$train_bins[idx[keep]],
+      intensity = intensity(p)[keep]
+    )
+  })
+
+  sample_names <- sapply(peaks, function(x)metaData(x)$sampleName)
+  feature_matrix <- intensityMatrix(peaks_mapped, spectra = spectra)
+  
+  rownames(feature_matrix) <- sample_names
+  df_fm <- as.data.frame(feature_matrix)
+  colnames(df_fm) <- as.character(round(as.numeric(colnames(df_fm)), 0))
+  
+  missing <- setdiff(colnames(fit$X), colnames(df_fm))
+  if (length(missing) > 0) {
+    df_fm[, missing] <- 0
+  }
+  df_fm <- df_fm[, colnames(fit$X)]
+  
+  df_fm
+}
+
+```
+
+
+```{r}
+# Recall, there are two preps - direct and extended direct - for each strain. To prevent data leakage, need to split into training and test based on strain identifier so each prep from a given strain ends up in the same partition
+# This was more important before moving to splitting train and test based on date
+
+df_dates2 <- df_dates %>% 
+  rename(sample_id = sample_names)
+
+meta <- as_tibble(sapply(raw_spectra, function(x)metaData(x)$sampleName)) %>% 
+  rename(sample_id = value) %>% 
+  left_join(df_dates2, by = "sample_id") %>% 
+  mutate(class = str_starts(sample_id, "mv"))  %>% 
+  mutate(class = str_replace(class, "FALSE", "typh")) %>% 
+  mutate(class = str_replace(class, "TRUE", "meganvac")) %>% 
+  separate(col = sample_id, sep = "_", into = c(NA, "sample_prep"), remove = F) %>% 
+  mutate(sample_prep = replace_na(sample_prep, "hcca")) %>% 
+  # sample_frac(., 1) %>% 
+  mutate(id = seq_along(raw_spectra)) %>% 
+  mutate(sample_id = str_replace(sample_id, "_fa", ""))
+
+strains <- meta %>% 
+  distinct(sample_id, class) %>% 
+  group_by(class) %>% 
+  mutate(fold = sample(rep(1:10, length.out = n()))) %>% # for CV evlauation, not using anymore
+  ungroup()
+
+meta_strains <- meta %>% 
+  left_join(strains, by = "sample_id") %>% 
+  mutate(row_idx = row_number())
+
+```
+
+```{r}
+set.seed(1988)
+
+# evaluate full RF model based on temporal split - different split for native and vaccine strains because they were not always collected on the same days
+
+train_idx <- which(meta_strains$date %in% c("nov_20_2025", "dec_09_2025", "dec_11_2025", "dec_18_2025", "dec_19_2025"))
+test_idx <- which(meta_strains$date %in% c("jan_15_2026", "jan_21_2026", "feb_10_2026"))
+  
+train_date_spectra <- raw_spectra[train_idx]
+test_date_spectra <- raw_spectra[test_idx]
+  
+fit <- fit_maldi(train_date_spectra)
+X_all_train <- fit$X
+X_all_train <- X_all_train %>% 
+  as_tibble(rownames = "class") %>% 
+  mutate(class = str_starts(class, "mv"))  %>% 
+  mutate(class = str_replace(class, "FALSE", "typh")) %>% 
+  mutate(class = as_factor(str_replace(class, "TRUE", "meganvac")))
+
+X_all_test <- apply_maldi(test_date_spectra, fit)
+X_all_test <- X_all_test %>% 
+  as_tibble(rownames = "class") %>% 
+  mutate(class = str_starts(class, "mv"))  %>% 
+  mutate(class = str_replace(class, "FALSE", "typh")) %>% 
+  mutate(class = as_factor(str_replace(class, "TRUE", "meganvac")))
+
+tree_model <- rand_forest(
+  trees = 750
+  ) %>% 
+  set_engine("ranger", importance = "permutation") %>% 
+  set_mode("classification")
+  
+tree_recipe <- recipe(class ~ ., data = X_all_train) %>% 
+  step_zv(all_predictors())
+  
+tree_workflow <- workflow() %>% 
+  add_model(tree_model) %>% 
+  add_recipe(tree_recipe) 
+
+tree_fit <- fit(tree_workflow, data = X_all_train)
+
+vip_scores <- tree_fit %>% 
+  extract_fit_engine() %>% 
+  .$variable.importance %>% 
+  enframe(name = "Feature", value = "Importance") %>% 
+  arrange(desc(Importance))
+  
+preds <- predict(tree_fit, new_data = X_all_test, type = "class")
+preds_prob <- predict(tree_fit, new_data = X_all_test, type = "prob")
+
+test_preds <- tibble(
+  row_idx = test_idx,
+  sample_id = meta_strains$sample_id[test_idx],
+  pred_class = preds$.pred_class,
+  class = X_all_test$class,
+  pred_typh = preds_prob$.pred_typh,
+  pred_meganvac = preds_prob$.pred_meganvac
+) %>% 
+  mutate(pred_class = fct_relevel(pred_class, "meganvac", "typh")) %>% 
+  mutate(class = fct_relevel(class, "meganvac", "typh"))
+  
+metrics <- test_preds %>% 
+  summarise(
+    accuracy = accuracy_vec(truth = class, estimate = pred_class),
+    balanced_accuracy = bal_accuracy_vec(truth = class, estimate = pred_class),
+    sensitivity = sens_vec(truth = class, estimate = pred_class),
+    specificity = spec_vec(truth = class, estimate = pred_class),
+    roc_auc = roc_auc_vec(truth = class, pred_meganvac),
+    precision = precision_vec(truth = class, estimate = pred_class),
+    neg_pv = npv_vec(truth = class, estimate = pred_class),
+    fnr = 1 - sensitivity,
+    fpr = 1 - specificity,
+  )
+
+metrics_full <- metrics %>% 
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "metric_value") %>% 
+  mutate(metric = str_replace(metric, "accuracy", "Accuracy")) %>% 
+  mutate(metric = str_replace(metric, "balanced_Accuracy", "Balanced Accuracy")) %>% 
+  mutate(metric = str_replace(metric, "specificity", "Specificity")) %>% 
+  mutate(metric = str_replace(metric, "sensitivity", "Sensitivity")) %>% 
+  mutate(metric = str_replace(metric, "roc_auc", "AUC")) %>% 
+  mutate(metric = str_replace(metric, "precision", "Positive Predictive Value")) %>% 
+  mutate(metric = str_replace(metric, "neg_pv", "Negative Predictive Value")) %>% 
+  mutate(metric = str_replace(metric, "fnr", "False Negative Rate")) %>% 
+  mutate(metric = str_replace(metric, "fpr", "False Positive Rate"))
+
+# may be slightly different despite setting seed depending on package and R versions
+metrics_full
+
+```
+
+
+```{r}
+# reduce model to peaks with n^2 < 0.1
+
+set.seed(1981)
+
+peak_stability <- df_pca_vaccine %>% 
+  pivot_longer(cols = where(is.numeric), names_to = "peak", values_to = "intensity") %>% 
+  group_by(peak) %>% 
+  summarize(
+    eta_sq = {
+      fit <- aov(intensity ~ date + sample_prep, data = cur_data())
+      ss <- summary(fit)[[1]]
+      ss["date", "Sum Sq"] / sum(ss[["Sum Sq"]])
+    },
+    .groups = "drop"
+  ) %>% 
+  mutate(peak_bin = round(as.numeric(peak), 0))
+
+peaks_retain <- peak_stability %>% 
+  dplyr::filter(eta_sq < 0.1) %>%
+  mutate(peak = as.numeric(peak))
+
+X_all_train_peaks <- X_all_train %>% 
+  pivot_longer(-class, names_to = "peak", values_to = "intensity") %>% 
+  count(peak) %>% 
+  mutate(peak = as.numeric(peak))
+
+X_all_train_peaks_keep <- difference_inner_join(
+  peaks_retain,
+  X_all_train_peaks,
+  by = "peak",
+  max_dist = 3
+) %>% 
+  arrange(peak.y)
+
+X_subset_train <- X_all_train %>% 
+  dplyr::select(class, as.character(X_all_train_peaks_keep$peak.y))
+
+X_subset_test <- X_all_test %>% 
+  dplyr::select(class, as.character(X_all_train_peaks_keep$peak.y))
+
+
+tree_model <- rand_forest(
+  trees = 750
+  ) %>% 
+  set_engine("ranger", importance = "permutation") %>% 
+  set_mode("classification")
+  
+tree_recipe <- recipe(class ~ ., data = X_subset_train) %>% 
+  step_zv(all_predictors())
+  
+tree_workflow <- workflow() %>% 
+  add_model(tree_model) %>% 
+  add_recipe(tree_recipe) 
+
+tree_fit <- fit(tree_workflow, data = X_subset_train)
+
+vip_scores <- tree_fit %>% 
+  extract_fit_engine() %>% 
+  .$variable.importance %>% 
+  enframe(name = "Feature", value = "Importance") %>% 
+  arrange(desc(Importance))
+  
+preds <- predict(tree_fit, new_data = X_subset_test, type = "class")
+preds_prob <- predict(tree_fit, new_data = X_subset_test, type = "prob")
+
+test_preds <- tibble(
+  row_idx = test_idx,
+  sample_id = meta_strains$sample_id[test_idx],
+  pred_class = preds$.pred_class,
+  class = X_subset_test$class,
+  pred_typh = preds_prob$.pred_typh,
+  pred_meganvac = preds_prob$.pred_meganvac
+) %>% 
+  mutate(pred_class = fct_relevel(pred_class, "meganvac", "typh")) %>% 
+  mutate(class = fct_relevel(class, "meganvac", "typh"))
+  
+metrics <- test_preds %>% 
+  summarise(
+    accuracy = accuracy_vec(truth = class, estimate = pred_class),
+    balanced_accuracy = bal_accuracy_vec(truth = class, estimate = pred_class),
+    sensitivity = sens_vec(truth = class, estimate = pred_class),
+    specificity = spec_vec(truth = class, estimate = pred_class),
+    roc_auc = roc_auc_vec(truth = class, pred_meganvac),
+    precision = precision_vec(truth = class, estimate = pred_class),
+    neg_pv = npv_vec(truth = class, estimate = pred_class),
+    fnr = 1 - sensitivity,
+    fpr = 1 - specificity,
+  )
+
+metrics_reduced <- metrics %>% 
+  pivot_longer(cols = everything(), names_to = "metric", values_to = "metric_value") %>% 
+  mutate(metric = str_replace(metric, "accuracy", "Accuracy")) %>% 
+  mutate(metric = str_replace(metric, "balanced_Accuracy", "Balanced Accuracy")) %>% 
+  mutate(metric = str_replace(metric, "specificity", "Specificity")) %>% 
+  mutate(metric = str_replace(metric, "sensitivity", "Sensitivity")) %>% 
+  mutate(metric = str_replace(metric, "roc_auc", "AUC")) %>% 
+  mutate(metric = str_replace(metric, "precision", "Positive Predictive Value")) %>% 
+  mutate(metric = str_replace(metric, "neg_pv", "Negative Predictive Value")) %>% 
+  mutate(metric = str_replace(metric, "fnr", "False Negative Rate")) %>% 
+  mutate(metric = str_replace(metric, "fpr", "False Positive Rate"))
+
+# may be slightly different despite setting seed depending on package and R versions
+metrics_reduced
+
+```
+
+```{r}
+# may be slightly different despite setting seed depending on package and R versions
+vip_scores %>% 
+  slice_max(Importance, n = 20) 
+
+```
+
+```{r}
+p2 <- vip_scores %>% 
+  slice_max(Importance, n = 10) %>%  
+  mutate(Feature = fct_relevel(Feature, "6046", "3612", "12011", "7093", "12097", "5141", "2233", "2465", "6480", "2978")) %>% 
+  mutate(Feature = fct_rev(Feature)) %>% 
+  ggplot(aes(x = Feature, y = Importance)) +
+  geom_col() +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 0.08)) +
+  scale_x_discrete(expand = expansion(add = 0.5)) +
+  #coord_flip(clip = "off") +
+  coord_cartesian(clip = "off") +
+  labs(x = "Peak (m/z)", y = "Variable Importance\n(Permutation)") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    #panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    plot.margin = margin(t = 5, r = 0, b = 0, l = 2),
+  )  
+
+```
+
+```{r}
+metrics_full <- metrics_full %>% 
+  mutate(model = "All Peaks")
+
+metrics_reduced <-  metrics_reduced %>% 
+  mutate(model = "Temporally Stable Peaks")
+
+p1 <- bind_rows(metrics_full, metrics_reduced) %>% 
+  dplyr::filter(metric %in% c("Sensitivity", "Specificity", "Balanced Accuracy")) %>%
+  dplyr::mutate(metric = str_replace(metric, "Balanced Accuracy", "Balanced\nAccuracy")) %>% 
+  mutate(metric = fct_relevel(metric, "Sensitivity", "Specificity", "Balanced\nAccuracy")) %>% 
+  ggplot(aes(x = metric, y = metric_value, fill = model)) +
+  geom_col(position = "dodge") +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 1.0)) +
+  scale_x_discrete() +
+  coord_cartesian(clip = "off") +
+  labs(x = "", y = "Value", fill = "Model") +
+  scale_fill_okabe_ito(order = c(9,7)) +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    #panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    #axis.text.x = element_text(angle = 45, hjust = 1),
+    axis.ticks = element_line(linewidth = 0.5),
+    plot.margin = margin(t = 5, r = 7, b = 0, l = 0),
+    legend.position = "bottom",
+    legend.margin = margin(-5, 0, 0, 0),
+    #legend.title = element_text(hjust = 0.5),
+    legend.title = element_blank(),
+    legend.text = element_text(margin = margin(l = 2, unit = "pt")),
+    legend.key.size = unit(0.35, "cm")
+  )    
+
+```
+
+```{r}
+# sweep through peaks to show increasing performance using subset of peaks - where does improvement occur
+
+set.seed(1987)
+
+peak_sets <- list(
+  c("6046"),
+  c("6046", "3612"),
+  c("6046", "3612", "12011"),
+  c("6046", "3612", "12011", "7093"),
+  c("6046", "3612", "12011", "7093", "12097"),
+  c("6046", "3612", "12011", "7093", "12097", "5141"),
+  c("6046", "3612", "12011", "7093", "12097", "5141", "2233"),
+  c("6046", "3612", "12011", "7093", "12097", "5141", "2233", "2465"),
+  c("6046", "3612", "12011", "7093", "12097", "5141", "2233", "2465", "6480"),
+  c("6046", "3612", "12011", "7093", "12097", "5141", "2233", "2465", "6480", "2978")
+)
+
+sweep_results <- lapply(1:10, function(n) {
+  top_n <- peak_sets[[n]]
+  
+  X_subset_train <- X_all_train %>% 
+    dplyr::select(class, any_of(top_n))
+
+  X_subset_test <- X_all_test %>% 
+    dplyr::select(class, any_of(top_n))
+  
+  sweep_recipe <- recipe(class ~ ., data = X_subset_train) %>% 
+    step_zv(all_predictors())
+  
+  sweep_workflow <- workflow() %>% 
+    add_model(tree_model) %>% 
+    add_recipe(sweep_recipe) 
+
+  tree_fit <- fit(sweep_workflow, data = X_subset_train)
+
+  preds <- predict(tree_fit, new_data = X_subset_test, type = "class")
+  preds_prob <- predict(tree_fit, new_data = X_subset_test, type = "prob")
+
+  test_preds <- tibble(
+    row_idx = test_idx,
+    sample_id = meta_strains$sample_id[test_idx],
+    pred_class = preds$.pred_class,
+    class = X_subset_test$class,
+    pred_typh = preds_prob$.pred_typh,
+    pred_meganvac = preds_prob$.pred_meganvac
+  ) %>% 
+    mutate(pred_class = fct_relevel(pred_class, "meganvac", "typh")) %>% 
+    mutate(class = fct_relevel(class, "meganvac", "typh"))
+    
+  metrics <- test_preds %>% 
+    summarise(
+      n_peaks = n,
+      accuracy = accuracy_vec(truth = class, estimate = pred_class),
+      balanced_accuracy = bal_accuracy_vec(truth = class, estimate = pred_class),
+      sensitivity = sens_vec(truth = class, estimate = pred_class),
+      specificity = spec_vec(truth = class, estimate = pred_class),
+      roc_auc = roc_auc_vec(truth = class, pred_meganvac),
+      precision = precision_vec(truth = class, estimate = pred_class),
+      neg_pv = npv_vec(truth = class, estimate = pred_class),
+      fnr = 1 - sensitivity,
+      fpr = 1 - specificity,
+    )
+}) %>% bind_rows()
+
+p3 <- sweep_results %>% 
+  dplyr::select(n_peaks, balanced_accuracy, sensitivity, specificity) %>%  # roc_auc
+  rename(`Balanced Accuracy` = balanced_accuracy, Sensitivity = sensitivity, Specificity = specificity) %>% # AUC = roc_auc
+  pivot_longer(-n_peaks, names_to = "metric", values_to = "value") %>% 
+  mutate(metric = fct_relevel(metric, "Sensitivity", "Specificity", "AUC", "Balanced Accuracy")) %>% 
+  ggplot(aes(x = n_peaks, y = value, color = metric)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous(expand = expansion(mult = 0), breaks = 1:10) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(0.90, 1)) +
+  coord_cartesian(clip = "off") +
+  labs(x = "Number of Peaks", y = "Value") + 
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    #panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    plot.margin = margin(t = 5, r = 8, b = 0, l = 3),
+    legend.position = "bottom",
+    legend.margin = margin(-5, 0, 0, 0),
+    legend.title = element_blank(),
+    legend.text = element_text(margin = margin(l = 2, unit = "pt"))
+  )
+
+p1 <- p1 + labs(tag = "A")
+p2 <- p2 + labs(tag = "B")
+p3 <- p3 + labs(tag = "C")
+
+p1 + p2 + p3 + plot_spacer() +
+  plot_layout(ncol = 2, widths = c(0.75, 1)) +
+  theme(plot.margin = margin(t = 0, r = 3, b = 0, l = -5))
+
+#ggsave("Figure_4.tiff", h = 5, w = 8.5, dpi = 150)
+
+```
+
+
+```{r}
+set.seed(1989)
+
+X_one_train <- X_all_train %>% 
+  dplyr::select(class, `6046`) %>% 
+  mutate(class = fct_relevel(class, "meganvac", "typh"))
+
+X_one_test <- X_all_test %>% 
+  dplyr::select(class, `6046`) %>% 
+  mutate(class = fct_relevel(class, "meganvac", "typh"))
+ 
+rpart_model <- decision_tree(tree_depth = 1, min_n = 5) %>% 
+  set_engine("rpart") %>% 
+  set_mode("classification")
+    
+rpart_recipe <- recipe(class ~ ., data = X_one_train) %>% 
+  step_zv(all_predictors()) %>% 
+  step_downsample(class)
+    
+rpart_workflow <- workflow() %>% 
+  add_model(rpart_model) %>% 
+  add_recipe(rpart_recipe)
+  
+rpart_fit <- fit(rpart_workflow, data = X_one_train)
+    
+tree_splits <- rpart_fit %>% 
+  extract_fit_engine() %>% 
+  .$frame %>% 
+  dplyr::filter(var != "<leaf>") %>% 
+  pull(var) %>% 
+  unique()
+
+preds <- predict(rpart_fit, new_data = X_one_test, type = "class")
+preds_prob <- predict(rpart_fit, new_data = X_one_test, type = "prob")
+    
+metrics <- tibble(
+  accuracy = accuracy_vec(truth = X_one_test$class, estimate = preds$.pred_class),
+  balanced_accuracy = bal_accuracy_vec(truth = X_one_test$class, estimate = preds$.pred_class),
+  sensitivity = sensitivity_vec(truth = X_one_test$class, estimate = preds$.pred_class),
+  specificity = specificity_vec(truth = X_one_test$class, estimate = preds$.pred_class),
+  roc_auc = roc_auc_vec(truth = X_one_test$class, preds_prob$.pred_meganvac),
+  precision = precision_vec(truth = X_one_test$class, estimate = preds$.pred_class),
+  neg_pv = npv_vec(truth = X_one_test$class, estimate = preds$.pred_class),
+  fnr = 1 - sensitivity,
+  fpr = 1 - specificity
+)
+
+cm_df <- data.frame(
+  truth = X_one_test$class,
+  predicted = preds$.pred_class
+)
+
+cm_plot_df <- cm_df %>% 
+  count(truth, predicted) %>% 
+  group_by(truth) %>% 
+  mutate(pct = n / sum(n)) %>% 
+  mutate(truth = str_replace(truth, "meganvac", "Megan Vac 1")) %>% 
+  mutate(predicted = str_replace(predicted, "meganvac", "Megan Vac 1")) %>% 
+  mutate(truth = str_replace(truth, "typh", "Native")) %>% 
+  mutate(predicted = str_replace(predicted, "typh", "Native"))
+
+p1 <- ggplot(cm_plot_df, aes(x = predicted, y = truth, fill = n)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = paste0(n, "\n(", round(pct * 100, 1), "%)")),
+            size = 3) +
+  scale_fill_gradient(low = "white", high = "steelblue") +
+  labs(x = "\nPredicted Class", y = "True Class\n") +
+  theme_minimal() +
+  theme(
+    legend.position = "none",
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_blank(),
+    panel.border = element_blank(),
+    panel.grid = element_blank(),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 0)
+  )
+
+train_dates <- c("nov_20_2025", "dec_09_2025", "dec_11_2025", "dec_18_2025", "dec_19_2025")
+
+df_pca_one <- df_pca %>% 
+  pivot_longer(cols = where(is.numeric), names_to = "peak", values_to = "intensity") %>% 
+  mutate(peak_bin = as.factor(round(as.numeric(peak), 0))) %>% 
+  dplyr::filter(peak_bin == "6046") %>% 
+  mutate(
+    partition = case_when(
+    date %in% train_dates ~ "Train",
+    TRUE ~ "Test"
+    )
+  ) %>% 
+  mutate(partition = fct_relevel(partition, "Train", "Test"))
+
+p2 <- df_pca_one %>% 
+  mutate(sample_type = str_replace(sample_type, "Vaccine", "Megan Vac 1")) %>% 
+  mutate(sample_type = fct_relevel(sample_type, "Native", "Megan Vac 1")) %>% 
+  ggplot(aes(x = sample_type, y = intensity)) +
+  geom_boxplot(outlier.shape = NA, width = 0.7) +
+  geom_jitter(width = 0.25, alpha = 0.25, size = 0.9) +
+  geom_hline(
+    yintercept = 0.0009588879,
+    linetype = "dashed",
+    #linewidth = 0.8,
+    color = "black"
+  ) +
+  facet_wrap(~partition) +
+  scale_y_continuous(expand = expansion(mult = 0), limits = c(0, 0.002)) +
+  scale_x_discrete(expand = expansion(add = 0.5)) +
+  labs(x = "", y = "Peak Intensity (m/z 6046)\n") +
+  coord_cartesian(clip = "off") +
+  theme_bw() +
+  theme(
+    panel.border = element_rect(fill = NA, color = "black", linewidth = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.text = element_text(color = "black"),
+    axis.ticks = element_line(linewidth = 0.5),
+    strip.background = element_blank(),
+    strip.text = element_text(color = "black", face = "bold"),
+    plot.margin = margin(t = 0, r = 0, b = 0, l = 0)
+  )  
+
+p1 + p2 + 
+  plot_annotation(tag_levels = 'A') +
+  plot_layout(widths = c(1.25, 1)) &
+  theme(plot.tag = element_text(vjust = -5),
+        plot.margin = margin(t = -10, r = 2, b = 0, l = 2))
+
+# ggsave("Figure_5.tiff", h = 3.5, w = 8) 
+
+
+```
+
